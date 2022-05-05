@@ -28,6 +28,7 @@
 
 #include "BTT.h"
 #include "fatfs_sd.h"
+#include "waveplayer.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,6 +46,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+DAC_HandleTypeDef hdac1;
+
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
@@ -71,6 +74,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_DAC1_Init(void);
 /* USER CODE BEGIN PFP */
 void transmit_uart (char * msg){
 	uint8_t len = strlen(msg);
@@ -113,13 +117,181 @@ void listDirectory (){
         if (fno.fname[size-3] == 't' && fno.fname[size-2] == 'x' && fno.fname[size-1] == 't' && fno.fname[0] != '.'){
         	sprintf(string, "%s\r\n", fno.fname);
         	transmit_uart(string);
-        	if (c<20){
-				strcpy(fileNames[c],string);
+        	if (allFilesCount<20){
+				strcpy(fileNames[allFilesCount],string);
 				allFilesCount++;
         	}
         }
       }
     }
+}
+
+#define BUFSIZE 512
+
+#define MIN(a,b) (((a)<(b))? (a):(b))
+typedef void (*funcP)(uint8_t channels, uint16_t numSamples, void *pIn, uint16_t *pOutput);
+
+uint8_t flg_dma_done;
+
+static uint8_t fileBuffer[BUFSIZE];
+static uint8_t dmaBuffer[2][BUFSIZE];
+static uint8_t dmaBank = 0;
+
+static void
+setSampleRate(uint16_t freq)
+{
+  uint16_t period = (80000000 / freq) - 1;
+
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = period;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  HAL_TIM_Base_Init(&htim4);
+}
+
+static inline uint16_t
+val2Dac8(int32_t v)
+{
+  uint16_t out = v << 3;
+  return out;
+}
+
+static inline uint16_t
+val2Dac16(int32_t v)
+{
+  v >>= 4;
+  v += 2047;
+  return v & 0xfff;
+}
+
+static void
+prepareDACBuffer_8Bit(uint8_t channels, uint16_t numSamples, void *pIn, uint16_t *pOutput)
+{
+  uint8_t *pInput = (uint8_t *)pIn;
+
+  for (int i=0; i<numSamples; i++) {
+    int32_t val = 0;
+
+    for(int j=0; j<channels; j++) {
+      val += *pInput++;
+    }
+    val /= channels;
+    *pOutput++ = val2Dac8(val);
+  }
+}
+
+static void
+prepareDACBuffer_16Bit(uint8_t channels, uint16_t numSamples, void *pIn, uint16_t *pOutput)
+{
+  int16_t *pInput = (int16_t *)pIn;
+
+  for (int i=0; i<numSamples; i++) {
+    int32_t val = 0;
+
+    for(int j=0; j<channels; j++) {
+      val += *pInput++;
+    }
+    val /= channels;
+    *pOutput++ = val2Dac16(val);
+  }
+}
+
+static void
+outputSamples(FIL *fil, struct Wav_Header *header)
+{
+  const uint8_t channels = header->channels;
+  const uint8_t bytesPerSample = header->bitsPerSample / 8;
+
+  funcP prepareData = (header->bitsPerSample == 8)? prepareDACBuffer_8Bit : prepareDACBuffer_16Bit;
+
+  flg_dma_done = 1;
+  dmaBank = 0;
+
+  uint32_t bytes_last = header->dataChunkLength;
+
+  while(0 < bytes_last) {
+
+    int blksize = (header->bitsPerSample == 8)? MIN(bytes_last, BUFSIZE / 2) : MIN(bytes_last, BUFSIZE);
+
+    UINT bytes_read;
+    FRESULT res;
+
+    res = f_read(fil, fileBuffer, blksize, &bytes_read);
+    if (res != FR_OK || bytes_read == 0)
+      break;
+
+    uint16_t numSamples = bytes_read / bytesPerSample / channels;
+    int16_t     *pInput = (int16_t *)fileBuffer;
+    uint16_t   *pOutput = (uint16_t *)dmaBuffer[dmaBank];
+
+    prepareData(channels, numSamples, pInput, pOutput);
+
+    // wait for DMA complete
+    while(flg_dma_done == 0) {
+      __NOP();
+    }
+
+    HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
+    flg_dma_done = 0;
+    HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t*)dmaBuffer[dmaBank], numSamples, DAC_ALIGN_12B_R);
+
+    dmaBank = !dmaBank;
+    bytes_last -= blksize;
+
+
+  };
+
+  while(flg_dma_done == 0) {
+    __NOP();
+  }
+
+  HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
+}
+
+static uint8_t
+isSupprtedWavFile(const struct Wav_Header *header)
+{
+  if (strncmp(header->riff, "RIFF", 4 ) != 0)
+    return 0;
+
+  if (header->vfmt != 1)
+    return 0;
+
+  if (strncmp(header->dataChunkHeader, "data", 4 ) != 0)
+    return 0;
+
+  return 1;
+}
+
+static void
+playWavFile(char *filename)
+{
+  FIL fil;
+  FRESULT res;
+  UINT count = 0;
+
+  struct Wav_Header header;
+
+  res = f_open(&fil, filename, FA_READ);
+  if (res != FR_OK)
+    return;
+
+  res = f_read(&fil, &header, sizeof(struct Wav_Header), &count);
+  if (res != FR_OK)
+    goto done;
+
+  if (!isSupprtedWavFile(&header))
+    goto done;
+
+  setSampleRate(header.sampleFreq);
+  outputSamples(&fil, &header);
+
+done :
+  res = f_close(&fil);
+  if (res != FR_OK)
+    return;
 }
 /* USER CODE END PFP */
 
@@ -132,6 +304,9 @@ uint16_t time_diff_arr[50];
 int rand_num ;
 int flag;
 int state = 1;
+
+extern AUDIO_PLAYBACK_StateTypeDef AudioState;
+int IsFinished = 0;
 /* USER CODE END 0 */
 
 /**
@@ -166,6 +341,7 @@ int main(void)
   MX_TIM16_Init();
   MX_TIM1_Init();
   MX_SPI1_Init();
+  MX_DAC1_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
@@ -178,54 +354,6 @@ int main(void)
 	   transmit_uart("Error Micro SD card mount\r\n");
    }
 
-//   fres = f_open(&fil, "/log-file.txt", FA_OPEN_APPEND | FA_WRITE | FA_READ);
-//   if (fres == FR_OK){
-//   	   transmit_uart("File opened for reading and checking free space\r\n");
-//      } else if (fres != FR_OK){
-//   	   transmit_uart("Error opening file for reading\r\n");
-//      }
-//
-//   fres = f_getfree("", &fre_clust, &pfs);
-//   totalSpace = (uint32_t) ((pfs->n_fatent - 2) * pfs->csize * 0.5);
-//   freeSpace = (uint32_t) (fre_clust * pfs->csize * 0.5);
-//   char mSz[12];
-//   sprintf(mSz, "%lu", freeSpace);
-//   if (fres == FR_OK){
-//	   transmit_uart("The free sapce is: ");
-//	   transmit_uart(mSz);
-//	   transmit_uart("\r\n");
-//   } else if (fres != FR_OK){
-//   	   transmit_uart("Error getting free space\r\n");
-//   }
-//
-//   f_puts("This text is written in the file.\r\n", &fil);
-//
-//   fres = f_close(&fil);
-//   if (fres == FR_OK){
-//   	   transmit_uart("File closed\n");
-//      } else if (fres != FR_OK){
-//      	   transmit_uart("Error closing file\r\n");
-//      }
-//
-//   fres = f_open(&fil, "log-file.txt", FA_READ);
-//   if (fres == FR_OK){
-//   	   transmit_uart("File opened\r\n");
-//      } else if (fres != FR_OK){
-//      	   transmit_uart("Error opening file\r\n");
-//      }
-//
-//   while (f_gets(buffer, sizeof(buffer), &fil)){
-//	   char mRd[100];
-//	   sprintf(mRd, "%s", buffer);
-//	   transmit_uart(mRd);
-//   }
-//
-//   fres = f_close(&fil);
-//   if (fres == FR_OK){
-//      	   transmit_uart("File closed\r\n");
-//         } else if (fres != FR_OK){
-//         	   transmit_uart("Error closing file\r\n");
-//         }
 
    listDirectory();
 
@@ -247,33 +375,37 @@ int main(void)
 //f_open(fp, path, mode)
 
 
+     // WAV Player
+     HAL_TIM_Base_Start(&htim4);
 
+     FATFS FatFs;
+     FRESULT res;
+     DIR dir;
+     FILINFO fno;
 
+     res = f_mount(&FatFs, "", 0);
+     if (res != FR_OK)
+       return EXIT_FAILURE;
 
+     res = f_opendir(&dir, "");
+     if (res != FR_OK)
+       return EXIT_FAILURE;
 
+     while(1) {
+       res = f_readdir(&dir, &fno);
+       if (res != FR_OK || fno.fname[0] == 0)
+         break;
 
+       char *filename = fno.fname;
 
+       if (strstr(filename, ".WAV") != 0) {
+         playWavFile(filename);
+       }
 
+       HAL_Delay(1000);
+     }
 
-
-
-
-
-
-
-
-   /* instantiate a new object */
-     BTT* btt = btt_new_default();
-
-     /* specify which functions should recieve notificaions */
-     btt_set_beat_tracking_callback   (btt, beat_detected_callback , NULL);
-
-     int buffer_size = 64;
-     dft_sample_t dft_buffer[buffer_size];
-
-
-
-
+     res = f_closedir(&dir);
 
 
   HAL_TIM_Base_Start(&htim16);
@@ -296,49 +428,50 @@ int main(void)
 
 		   // Show on LCD the file -> fileNames[counterFiles]
 
-		   if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == 1){
-			   break;
-			}
-			else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 1){
-				counterFiles = (counterFiles+1)%allFilesCount;
-			}
+//		   if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == 1){
+//			   break;
+//			}
+//			else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 1){
+//				counterFiles = (counterFiles+1)%allFilesCount;
+//			}
 	   }
 
-	   fres = f_open(&fil, fileNames[counterFiles], FA_READ);
-	   if (fres == FR_OK){
-		   transmit_uart("File opened\r\n");
-	   } else if (fres != FR_OK){
-		   transmit_uart("Error opening file\r\n");
-	   }
-
-	  while (f_gets(buffer, sizeof(buffer), &fil)){
-	  /*
-	   * TASK1 1. Read from music file
-	   * TASK1 2. Start beat analysis (callback releases binary semaph for training)
-	   * TASK1 3. Play music file
-	   * TASK1 4. Write to log file the metrics OR LCD
-	   * TASK2 5. Training (light LED and check button pressed and calculate metrics accordingly)
-	   *
-	   */
-		   char mRd[100];
-		   sprintf(mRd, "%s", buffer);
-		   transmit_uart(mRd);
-
-		   /* Fill a buffer with your audio samples here then pass it to btt */
-		   btt_process(btt, dft_buffer, buffer_size);
-
-
-		}
+//	   fres = f_open(&fil, fileNames[counterFiles], FA_READ);
+//	   if (fres == FR_OK){
+//		   transmit_uart("File opened\r\n");
+//	   } else if (fres != FR_OK){
+//		   transmit_uart("Error opening file\r\n");
+//	   }
+//
+//	  while (f_gets(buffer, sizeof(buffer), &fil)){
+//	  /*
+//	   * TASK1 1. Read from music file
+//	   * TASK1 2. Start beat analysis (callback releases binary semaph for training)
+//	   * TASK1 3. Play music file
+//	   * TASK1 4. Write to log file the metrics OR LCD
+//	   * TASK2 5. Training (light LED and check button pressed and calculate metrics accordingly)
+//	   *
+//	   */
+//
+//		   char mRd[100];
+//		   sprintf(mRd, "%s", buffer);
+//		   transmit_uart(mRd);
+//
+//		   /* Fill a buffer with your audio samples here then pass it to btt */
+//		   btt_process(btt, dft_buffer, buffer_size);
+//
+//
+//		}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 
-	  fres = f_close(&fil);
-	  if (fres == FR_OK){
-		   transmit_uart("File closed\r\n");
-	  } else if (fres != FR_OK){
-		   transmit_uart("Error closing file\r\n");
-	  }
+//	  fres = f_close(&fil);
+//	  if (fres == FR_OK){
+//		   transmit_uart("File closed\r\n");
+//	  } else if (fres != FR_OK){
+//		   transmit_uart("Error closing file\r\n");
+//	  }
 
 
   }
@@ -399,6 +532,47 @@ void SystemClock_Config(void)
   /** Enable MSI Auto calibration
   */
   HAL_RCCEx_EnableMSIPLLMode();
+}
+
+/**
+  * @brief DAC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC1_Init(void)
+{
+
+  /* USER CODE BEGIN DAC1_Init 0 */
+
+  /* USER CODE END DAC1_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC1_Init 1 */
+
+  /* USER CODE END DAC1_Init 1 */
+  /** DAC Initialization
+  */
+  hdac1.Instance = DAC1;
+  if (HAL_DAC_Init(&hdac1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_T6_TRGO;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC1_Init 2 */
+
+  /* USER CODE END DAC1_Init 2 */
+
 }
 
 /**
@@ -570,16 +744,16 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED0_Pin|LED1_Pin|LED2_Pin|LED5_Pin
-                          |GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED0_Pin|LED1_Pin|LED5_Pin|GPIO_PIN_9
+                          |GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : LED0_Pin LED1_Pin LED2_Pin LED5_Pin
-                           PA9 PA10 */
-  GPIO_InitStruct.Pin = LED0_Pin|LED1_Pin|LED2_Pin|LED5_Pin
-                          |GPIO_PIN_9|GPIO_PIN_10;
+  /*Configure GPIO pins : LED0_Pin LED1_Pin LED5_Pin PA9
+                           PA10 */
+  GPIO_InitStruct.Pin = LED0_Pin|LED1_Pin|LED5_Pin|GPIO_PIN_9
+                          |GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
