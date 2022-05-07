@@ -28,16 +28,20 @@
 
 #include "BTT.h"
 #include "fatfs_sd.h"
-#include "waveplayer.h"
+#include "waveheader.h"
+#include "lcd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef void (*funcP)(uint8_t channels, uint16_t numSamples, void *pIn, uint16_t *pOutput);
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BUFSIZE 512
+#define AUDIO_BUFFER_SIZE 512
+#define MIN(a,b) (((a)<(b))? (a):(b))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +55,7 @@ DAC_HandleTypeDef hdac1;
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart2;
@@ -65,6 +70,11 @@ uint32_t totalSpace, freeSpace;
 char buffer[100];
 char fileNames [20][20] = {0};
 int allFilesCount = 0;
+
+static uint8_t fileBuffer[BUFSIZE];
+static uint8_t dmaBuffer[2][BUFSIZE];
+static uint8_t dmaBank = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,7 +85,10 @@ static void MX_TIM16_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_DAC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+void training ();
+void beat_detected_callback (void* SELF, unsigned long long sample_time);
 void transmit_uart (char * msg){
 	uint8_t len = strlen(msg);
 	HAL_UART_Transmit (&huart2, (uint8_t*) msg, len, 200);
@@ -92,10 +105,8 @@ void listDirectory (){
 
     res = f_opendir(&dir, path);
 
-#ifdef DBG
-    if (res != FR_OK)
-      printf("res = %d f_opendir\n", res);
-#endif
+//    if (res != FR_OK)
+//      printf("res = %d f_opendir\n", res);
 
     if (res == FR_OK)
     {
@@ -105,18 +116,18 @@ void listDirectory (){
 
         res = f_readdir(&dir, &fno);
 
-#ifdef DBG
-        if (res != FR_OK)
-          printf("res = %d f_readdir\n", res);
-#endif
+//        if (res != FR_OK)
+//          printf("res = %d f_readdir\n", res);
 
         if ((res != FR_OK) || (fno.fname[0] == 0))
           break;
 
         int size = strlen(fno.fname);
-        if (fno.fname[size-3] == 't' && fno.fname[size-2] == 'x' && fno.fname[size-1] == 't' && fno.fname[0] != '.'){
-        	sprintf(string, "%s\r\n", fno.fname);
-        	transmit_uart(string);
+        sprintf(string, "%s\r\n", fno.fname);
+                	transmit_uart(string);
+        if (fno.fname[size-3] == 'w' && fno.fname[size-2] == 'a' && fno.fname[size-1] == 'v' && fno.fname[0] != '.'){
+//        	sprintf(string, "%s\r\n", fno.fname);
+//        	transmit_uart(string);
         	if (allFilesCount<20){
 				strcpy(fileNames[allFilesCount],string);
 				allFilesCount++;
@@ -125,30 +136,18 @@ void listDirectory (){
       }
     }
 }
-
-#define BUFSIZE 512
-
-#define MIN(a,b) (((a)<(b))? (a):(b))
-typedef void (*funcP)(uint8_t channels, uint16_t numSamples, void *pIn, uint16_t *pOutput);
-
-uint8_t flg_dma_done;
-
-static uint8_t fileBuffer[BUFSIZE];
-static uint8_t dmaBuffer[2][BUFSIZE];
-static uint8_t dmaBank = 0;
-
 static void
 setSampleRate(uint16_t freq)
 {
   uint16_t period = (80000000 / freq) - 1;
 
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = period;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  HAL_TIM_Base_Init(&htim4);
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = period;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  HAL_TIM_Base_Init(&htim2);
 }
 
 static inline uint16_t
@@ -198,57 +197,7 @@ prepareDACBuffer_16Bit(uint8_t channels, uint16_t numSamples, void *pIn, uint16_
   }
 }
 
-static void
-outputSamples(FIL *fil, struct Wav_Header *header)
-{
-  const uint8_t channels = header->channels;
-  const uint8_t bytesPerSample = header->bitsPerSample / 8;
 
-  funcP prepareData = (header->bitsPerSample == 8)? prepareDACBuffer_8Bit : prepareDACBuffer_16Bit;
-
-  flg_dma_done = 1;
-  dmaBank = 0;
-
-  uint32_t bytes_last = header->dataChunkLength;
-
-  while(0 < bytes_last) {
-
-    int blksize = (header->bitsPerSample == 8)? MIN(bytes_last, BUFSIZE / 2) : MIN(bytes_last, BUFSIZE);
-
-    UINT bytes_read;
-    FRESULT res;
-
-    res = f_read(fil, fileBuffer, blksize, &bytes_read);
-    if (res != FR_OK || bytes_read == 0)
-      break;
-
-    uint16_t numSamples = bytes_read / bytesPerSample / channels;
-    int16_t     *pInput = (int16_t *)fileBuffer;
-    uint16_t   *pOutput = (uint16_t *)dmaBuffer[dmaBank];
-
-    prepareData(channels, numSamples, pInput, pOutput);
-
-    // wait for DMA complete
-    while(flg_dma_done == 0) {
-      __NOP();
-    }
-
-    HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
-    flg_dma_done = 0;
-    HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t*)dmaBuffer[dmaBank], numSamples, DAC_ALIGN_12B_R);
-
-    dmaBank = !dmaBank;
-    bytes_last -= blksize;
-
-
-  };
-
-  while(flg_dma_done == 0) {
-    __NOP();
-  }
-
-  HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
-}
 
 static uint8_t
 isSupprtedWavFile(const struct Wav_Header *header)
@@ -264,35 +213,6 @@ isSupprtedWavFile(const struct Wav_Header *header)
 
   return 1;
 }
-
-static void
-playWavFile(char *filename)
-{
-  FIL fil;
-  FRESULT res;
-  UINT count = 0;
-
-  struct Wav_Header header;
-
-  res = f_open(&fil, filename, FA_READ);
-  if (res != FR_OK)
-    return;
-
-  res = f_read(&fil, &header, sizeof(struct Wav_Header), &count);
-  if (res != FR_OK)
-    goto done;
-
-  if (!isSupprtedWavFile(&header))
-    goto done;
-
-  setSampleRate(header.sampleFreq);
-  outputSamples(&fil, &header);
-
-done :
-  res = f_close(&fil);
-  if (res != FR_OK)
-    return;
-}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -301,12 +221,12 @@ volatile uint16_t timer_end;
 uint16_t timer_val;
 uint16_t time_diff;
 uint16_t time_diff_arr[50];
-int rand_num ;
+int rand_num;
 int flag;
 int state = 1;
-
-extern AUDIO_PLAYBACK_StateTypeDef AudioState;
-int IsFinished = 0;
+int detected = 0;
+int counter = 0;
+char buff [100] = {0};
 /* USER CODE END 0 */
 
 /**
@@ -343,7 +263,20 @@ int main(void)
   MX_SPI1_Init();
   MX_DAC1_Init();
   MX_FATFS_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+
+  // SETUP LCD
+//   // Lcd_PortType ports[] = { D4_GPIO_Port, D5_GPIO_Port, D6_GPIO_Port, D7_GPIO_Port };
+//   Lcd_PortType ports[] = { GPIOA, GPIOA, GPIOA, GPIOA };
+//   // Lcd_PinType pins[] = {D4_Pin, D5_Pin, D6_Pin, D7_Pin};
+//   Lcd_PinType pins[] = {LCD4_Pin, LCD5_Pin, LCD6_Pin, LCD7_Pin};
+//   Lcd_HandleTypeDef lcd;
+//
+//   // Lcd_create(ports, pins, RS_GPIO_Port, RS_Pin, EN_GPIO_Port, EN_Pin, LCD_4_BIT_MODE);
+//   lcd = Lcd_create(ports, pins, LCDRS_GPIO_Port, LCDRS_Pin, LCDE_GPIO_Port, LCDE_Pin, LCD_4_BIT_MODE);
+//   Lcd_cursor(&lcd, 0,1);
+//   Lcd_string(&lcd, "Welcome");
 
   HAL_Delay(500);
 
@@ -354,20 +287,12 @@ int main(void)
 	   transmit_uart("Error Micro SD card mount\r\n");
    }
 
-
    listDirectory();
 
 
-   fres = f_mount(NULL, "", 1);
-   if (fres == FR_OK){
-      	   transmit_uart("Micro SD unmounted\r\n");
-         } else if (fres != FR_OK){
-         	   transmit_uart("Error unmounting SD card\r\n");
-         }
-
    transmit_uart(fileNames[0]);
-   transmit_uart(fileNames[1]);
-   transmit_uart(fileNames[2]);
+//   transmit_uart(fileNames[1]);
+//   transmit_uart(fileNames[2]);
 //   f_opendir(dp, "/")
 //f_readdir(dp, fno)
 // https://community.st.com/s/question/0D53W00000wzjSmSAI/fatfs-show-all-files
@@ -376,36 +301,7 @@ int main(void)
 
 
      // WAV Player
-     HAL_TIM_Base_Start(&htim4);
-
-     FATFS FatFs;
-     FRESULT res;
-     DIR dir;
-     FILINFO fno;
-
-     res = f_mount(&FatFs, "", 0);
-     if (res != FR_OK)
-       return EXIT_FAILURE;
-
-     res = f_opendir(&dir, "");
-     if (res != FR_OK)
-       return EXIT_FAILURE;
-
-     while(1) {
-       res = f_readdir(&dir, &fno);
-       if (res != FR_OK || fno.fname[0] == 0)
-         break;
-
-       char *filename = fno.fname;
-
-       if (strstr(filename, ".WAV") != 0) {
-         playWavFile(filename);
-       }
-
-       HAL_Delay(1000);
-     }
-
-     res = f_closedir(&dir);
+     HAL_TIM_Base_Start(&htim2);
 
 
   HAL_TIM_Base_Start(&htim16);
@@ -413,55 +309,172 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  int counter = 0;
   int sum = 0;
   int average = 0;
-  char buff [100] = {0};
   int once = 1;
+  int count = 0;
+
+
+//   Lcd_cursor(&lcd, 1,1);
+//   Lcd_string(&lcd, "Let's Begin");
+//
+//   HAL_Delay(2000);
+//
+//   Lcd_cursor(&lcd, 0,1);
+//   Lcd_string(&lcd, "Song name here");
+//
+//   Lcd_cursor(&lcd, 1,0);
+//   Lcd_string(&lcd, "Btn2: play / Btn1: next");
 
   HAL_Delay(5000);
   uint16_t end_time, start_time = __HAL_TIM_GET_COUNTER(&htim16);
+
+  //till now, you have all file names on mounted sd card stored in fileNames and their count in allFilesCount
+  //	  /*
+  //	   * TASK1 1. Read from music file
+  //	   * TASK1 2. Start beat analysis (callback releases binary semaph for training)
+  //	   * TASK1 3. Play music file
+  //	   * TASK1 4. Training (light LED and check button pressed and calculate metrics accordingly)
+  //	   */
   while (1)
   {
+	  //make user choose a file from the list of files on sd card
 	   int counterFiles = 0;
-	   while(1){
-
-		   // Show on LCD the file -> fileNames[counterFiles]
-
-//		   if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == 1){
-//			   break;
+//	   while(1){
+//
+//		   // Show on LCD the file -> fileNames[counterFiles]
+////		   Lcd_cursor(&lcd, 0,0);
+////		   Lcd_int(&lcd, counterFiles);
+////
+////		   Lcd_cursor(&lcd, 0,2);
+////		   Lcd_string(&lcd, fileNames[counterFiles]);
+//
+//		   if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == 1){
+//			   break; //valid choice of song (read it and process it) -> counterFiles has the song index
 //			}
 //			else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 1){
-//				counterFiles = (counterFiles+1)%allFilesCount;
+//				counterFiles++;
 //			}
+//		   counterFiles = counterFiles%allFilesCount;
+//	   }
+
+
+	   //open file and read header
+	   fres = f_open(&fil, fileNames[counterFiles], FA_READ);
+	   if (fres == FR_OK){
+		   transmit_uart("File opened\r\n");
+	   } else if (fres != FR_OK){
+		   break;
 	   }
 
-//	   fres = f_open(&fil, fileNames[counterFiles], FA_READ);
-//	   if (fres == FR_OK){
-//		   transmit_uart("File opened\r\n");
-//	   } else if (fres != FR_OK){
-//		   transmit_uart("Error opening file\r\n");
-//	   }
-//
-//	  while (f_gets(buffer, sizeof(buffer), &fil)){
-//	  /*
-//	   * TASK1 1. Read from music file
-//	   * TASK1 2. Start beat analysis (callback releases binary semaph for training)
-//	   * TASK1 3. Play music file
-//	   * TASK1 4. Write to log file the metrics OR LCD
-//	   * TASK2 5. Training (light LED and check button pressed and calculate metrics accordingly)
-//	   *
-//	   */
-//
-//		   char mRd[100];
-//		   sprintf(mRd, "%s", buffer);
-//		   transmit_uart(mRd);
-//
-//		   /* Fill a buffer with your audio samples here then pass it to btt */
-//		   btt_process(btt, dft_buffer, buffer_size);
-//
-//
-//		}
+	   //pre-process the file and load beats using BTT
+	   int* beats ;
+	   beats = (int *)calloc (300 , sizeof(int) );
+
+	   size_t bytesRead = 0;
+	   dft_sample_t* bufferf = calloc(AUDIO_BUFFER_SIZE/8, sizeof(*bufferf));
+	   char buffb [512] = {0};
+
+	   BTT* btt = btt_new_default();
+	   btt_set_beat_tracking_callback   (btt, beat_detected_callback , NULL);
+
+	   char debug [100] = {0};
+	   // read up to sizeof(buffer) bytes
+	   while ((f_read(&fil, buffb, AUDIO_BUFFER_SIZE, &bytesRead)) != FR_OK){
+		   if (bytesRead > 0){
+		     count++;
+		     for(int i=0; i<AUDIO_BUFFER_SIZE/8; i++)
+			 {
+			   memcpy (&bufferf[i], buffb+(i*8), sizeof (float));
+//			   sprintf(debug, "%f\r\n", bufferf[i]);
+//			   transmit_uart(debug);
+			   bufferf[i] = bufferf[i] / (long double)0x7FFFFFFF;
+			 }
+		     btt_process(btt, bufferf, AUDIO_BUFFER_SIZE/8);
+		     beats[detected] = count;
+		   }
+		   else {
+			   break;
+		   }
+	   }
+
+	   //read header
+       struct Wav_Header header;
+       int countHeader = 0;
+       //rewind file pointer to the start of the file
+	   fres = f_lseek(&fil, 0);
+	   fres = f_read(&fil, &header, sizeof(struct Wav_Header), &countHeader);
+
+	   if (fres != FR_OK)
+	   {
+		  //error reading header
+		  transmit_uart("Error reading header\r\n");
+		  break;
+	   }
+	   if (!isSupprtedWavFile(&header))
+	   {
+		   //error unsupported file
+           transmit_uart("Error unsupported file\r\n");
+           break;
+	   }
+
+	   //set sample rate
+	   setSampleRate(header.sampleFreq);
+	   const uint8_t channels = header.channels;
+	   const uint8_t bytesPerSample = header.bitsPerSample / 8;
+
+       funcP prepareData = (header.bitsPerSample == 8)? prepareDACBuffer_8Bit : prepareDACBuffer_16Bit;
+       uint32_t bytes_last = header.dataChunkLength;
+
+
+       //////////////////////////////BEAT
+
+
+       int index = 0;
+	   int beats_index = 0;
+	   int beat = beats[0];
+
+	   transmit_uart("Beginning playing song\r\n");
+
+	   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+
+	   while(0 < bytes_last) {
+
+		   int blksize = (header.bitsPerSample == 8)? MIN(bytes_last, BUFSIZE / 2) : MIN(bytes_last, BUFSIZE);
+
+		   UINT bytes_read;
+		   FRESULT res;
+
+		   res = f_read(&fil, fileBuffer, blksize, &bytes_read);
+		   if (res != FR_OK || bytes_read == 0)
+			   break;
+
+		   uint16_t numSamples = bytes_read / bytesPerSample / channels;
+		   int16_t     *pInput = (int16_t *)fileBuffer;
+		   uint16_t   *pOutput = (uint16_t *)dmaBuffer[dmaBank];
+
+		   prepareData(channels, numSamples, pInput, pOutput);
+
+//		   HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t*)dmaBuffer[dmaBank], numSamples, DAC_ALIGN_12B_R);
+//		   for (int j=0; j<numSamples; j++){
+//			   HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, *dmaBuffer[j]);
+//			   HAL_Delay(0.001);
+//		   }
+//		   HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, *dmaBuffer[dmaBank]);
+//		   DAC1->DHR12R1 = *dmaBuffer[dmaBank];
+		   if (beat == index ){
+			   //get rand(), pick a random LED
+//			   training();
+			   beats_index++;
+			   beats_index = beats_index % 300;
+			   beat = beats[beats_index];
+		   }
+//		   dmaBank = !dmaBank;
+		   bytes_last -= blksize;
+		   index++;
+	   }
+	   transmit_uart("Done\r\n");
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -561,7 +574,7 @@ static void MX_DAC1_Init(void)
   /** DAC channel OUT1 config
   */
   sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
-  sConfig.DAC_Trigger = DAC_TRIGGER_T6_TRGO;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
   sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
   sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
@@ -663,6 +676,51 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief TIM16 Initialization Function
   * @param None
   * @retval None
@@ -744,25 +802,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED0_Pin|LED1_Pin|LED5_Pin|GPIO_PIN_9
-                          |GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED0_Pin|LED1_Pin|LED2_Pin|LCD4_Pin
+                          |LCD5_Pin|LCD6_Pin|LCD7_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : LED0_Pin LED1_Pin LED5_Pin PA9
-                           PA10 */
-  GPIO_InitStruct.Pin = LED0_Pin|LED1_Pin|LED5_Pin|GPIO_PIN_9
-                          |GPIO_PIN_10;
+  /*Configure GPIO pins : LED0_Pin LED1_Pin LED2_Pin LCD4_Pin
+                           LCD5_Pin LCD6_Pin LCD7_Pin */
+  GPIO_InitStruct.Pin = LED0_Pin|LED1_Pin|LED2_Pin|LCD4_Pin
+                          |LCD5_Pin|LCD6_Pin|LCD7_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 PB4 PB5
-                           PB6 PB7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5
-                          |GPIO_PIN_6|GPIO_PIN_7;
+  /*Configure GPIO pins : PB1 PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
@@ -771,108 +827,80 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
 }
 
 /* USER CODE BEGIN 4 */
-//void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-//{
-////	flag = 1;
-////	if (rand_num == 0 && GPIO_Pin == PB_0_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED0_Pin, 0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else if (rand_num == 1 && GPIO_Pin == PB_1_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED1_Pin,0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else if (rand_num == 2 && GPIO_Pin == PB_2_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED2_Pin, 0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else if (rand_num == 3 && GPIO_Pin == PB_3_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED3_Pin, 0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else if (rand_num == 4 && GPIO_Pin == PB_4_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED4_Pin, 0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else if (rand_num == 5 && GPIO_Pin == PB_5_Pin){
-////		HAL_GPIO_WritePin(GPIOA, LED5_Pin, 0);
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-////	}
-////	else {
-////		timer_end = __HAL_TIM_GET_COUNTER(&htim16) + 5000;
-////	}
-//
-//
-//	if (rand_num == 0 && GPIO_Pin == PB_0_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//	else if (rand_num == 1 && GPIO_Pin == PB_1_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//	else if (rand_num == 2 && GPIO_Pin == PB_2_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//	else if (rand_num == 3 && GPIO_Pin == PB_3_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//	else if (rand_num == 4 && GPIO_Pin == PB_4_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//	else if (rand_num == 5 && GPIO_Pin == PB_5_Pin && state == 1){
-//		HAL_TIM_Base_Start_IT(&htim1);
-//		state = 0;
-//	}
-//
-//}
+void training (){
+	 flag = 0;
+	 if (counter < 50 ){
+		 rand_num = rand()%3;
+		 __HAL_TIM_SET_COUNTER(&htim16, 0);
+		 timer_val = __HAL_TIM_GET_COUNTER(&htim16);
+		 if (rand_num == 0)
+			  HAL_GPIO_WritePin(GPIOA, LED0_Pin, 1);
+		 else if (rand_num == 1)
+			  HAL_GPIO_WritePin(GPIOA, LED1_Pin,1);
+		 else if (rand_num == 2)
+			  HAL_GPIO_WritePin(GPIOA, LED2_Pin, 1);
+
+	  state = 1;
+	  flag = 0;
+	  HAL_TIM_Base_Start_IT(&htim1);
+	  while (state == 1){
+		if (rand_num == 0 && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 1){
+			HAL_GPIO_WritePin(GPIOA, LED0_Pin, 0);
+			timer_end = __HAL_TIM_GET_COUNTER(&htim16);
+			state = 0;
+			flag = 1;
+			HAL_TIM_Base_Stop_IT(&htim1);
+			__HAL_TIM_SET_COUNTER(&htim1, 0);
+		}
+		else if (rand_num == 1 && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == 1){
+			HAL_GPIO_WritePin(GPIOA, LED1_Pin,0);
+			timer_end = __HAL_TIM_GET_COUNTER(&htim16);
+			state = 0;
+			flag = 1;
+			HAL_TIM_Base_Stop_IT(&htim1);
+			__HAL_TIM_SET_COUNTER(&htim1, 0);
+		}
+		else if (rand_num == 2 && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == 1){
+			HAL_GPIO_WritePin(GPIOA, LED2_Pin, 0);
+			timer_end = __HAL_TIM_GET_COUNTER(&htim16);
+			state = 0;
+			flag = 1;
+			HAL_TIM_Base_Stop_IT(&htim1);
+			__HAL_TIM_SET_COUNTER(&htim1, 0);
+		}
+	  }
+	  HAL_TIM_Base_Stop_IT(&htim1);
+
+	  HAL_GPIO_WritePin(GPIOA, LED0_Pin, 0);
+	  HAL_GPIO_WritePin(GPIOA, LED1_Pin, 0);
+	  HAL_GPIO_WritePin(GPIOA, LED2_Pin, 0);
+
+	  if (flag == 0) {
+		  timer_end = __HAL_TIM_GET_COUNTER(&htim16);
+		  time_diff  = timer_end - timer_val;
+	  }
+	  else {
+		  time_diff  = timer_end - timer_val;
+	  }
+
+	  time_diff_arr[counter] = time_diff;
+	  counter++;
+
+	  HAL_Delay(1000);
+
+	  sprintf(buff, "%d: %u    \r\n", counter, time_diff);
+	  HAL_UART_Transmit(&huart2, (uint8_t*) buff, sizeof(buff), 100);
+	 }
+}
 void HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim){
 
-//	if (HAL_GPIO_ReadPin())
-//	flag = 1;
-//	if (rand_num == 0 && HAL_GPIO_ReadPin(GPIOB, PB_0_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, LED0_Pin, 0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else if (rand_num == 1 && HAL_GPIO_ReadPin(GPIOB, PB_1_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, LED1_Pin,0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else if (rand_num == 2 && HAL_GPIO_ReadPin(GPIOB, PB_2_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, LED2_Pin, 0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else if (rand_num == 3 && HAL_GPIO_ReadPin(GPIOB, PB_3_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else if (rand_num == 4 && HAL_GPIO_ReadPin(GPIOB, PB_4_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, 0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else if (rand_num == 5 && HAL_GPIO_ReadPin(GPIOB, PB_5_Pin) == 0){
-//		HAL_GPIO_WritePin(GPIOA, LED5_Pin, 0);
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16);
-//		state = 1;
-//	}
-//	else {
-//		timer_end = __HAL_TIM_GET_COUNTER(&htim16) + 5000;
-//		state = 1;
-//	}
+
 	if (htim == &htim1){
 		HAL_TIM_Base_Stop_IT(&htim1);
 		state = 0;
@@ -881,7 +909,15 @@ void HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim){
 /*--------------------------------------------------------------------*/
 void beat_detected_callback (void* SELF, unsigned long long sample_time)
 {
-  //called when beat was detected
+
+
+  detected++;
+//    printf(" count : %d , detected: %d \n", count , detected );
+
+  /*MKAiff* beat_aiff = (MKAiff*) SELF;
+  aiffSetPlayheadToSamples     (beat_aiff, sample_time);
+  float click = 1;
+  aiffAddFloatingPointSamplesAtPlayhead(beat_aiff, &click, 1, aiffFloatSampleType, aiffYes);*/
 }
 /* USER CODE END 4 */
 
