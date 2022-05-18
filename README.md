@@ -1,3 +1,7 @@
+# Repo:
+
+[Github Repo](https://github.com/shgabr/Beat-Punch)
+
 ## Team Members:
 Mina Gamil
 
@@ -73,13 +77,62 @@ For the first prototype, we decided to implement the logic to light the LEDs at 
 
 
 # Second Prototype
-**In Progress**
+
+We can now mount an sd card and do the following operations on it:
+- List all files of a certain extension on the file system
+- Read and write to different files
+
+We also configured the LCD screen to display messages to the user throughout the training, such as file names, training progress, and his performance.
+Using the above file operations, we give the user the option to pick a certain music file from the sd card. This file is then preprocessed for its beats and stored in a memory buffer. Then, we start reading the wav file and playing it over the onboard Digital-to-Analog converter. We then start shuffling the LEDs based on the preprocessed beats while logging the user performance. Once the training is completed, the user has an option to restart training or to shutdown the session and save performance metrics to a file on the sd card.
+
+Note: The beat analysis code works fine on Linux and Windows computers, but on the embedded device, it sometimes leads to runtime error due to unalloacted memory access. We are still trying to debug this to find the source of error. Also, the music playback works fine on its own, but when integrated with the complete code, the music player plays noise and not the real WAV file.
+
+## Prototype 2 Connections:
+![IMG_8128](https://user-images.githubusercontent.com/50206867/167273334-ccaba11e-f218-435a-961b-d89edf49acfd.JPG)
+
+### Hardware used in this prototype:
+- All prototype 1 hardware
+- Micro SD card module
+- AUX (TRRS) module
+- LCD Screen
+- Potentiometer 
+
+\* Prototype 2 code is available on the [Github Repo](https://github.com/shgabr/Beat-Punch)
 
 # Final Prototype
- **In Progress**
+
+In the final prototype, we added a DFPlayer module after being unable to play good quality music using DAC and TRRS module. The DFPlayer reads the music files from an SD card and plays it over a 3W speaker. 
+
+So, now the MicroSD card adapter is responsible for taking a specific format of the beats files *.txt, which is used to light the LEDs on each beat.
+
+The user has the ability to choose which music file to play using 2 push buttons, and the beats file with the same name is chosen. 
+
+Note: We changed the LCD to another nucleo board due to the limitations of the pins. Now, we have 2 nucleo boards which communicate over UART. One is responsible for the training playing music, and applying beats, and the other is responsible for displaying the message recieved from the UART over the LCD.
+
+## Final Prototype Connections:
+
+![File_000](https://user-images.githubusercontent.com/50206867/169003816-58fc8769-7580-41f2-a1b0-a6ffccd2ed38.png)
+
+
+### The Final Hardware used in the project:
+- 2 STM32 l432 nucleo boards
+- 3 push buttons
+- 3 LEDs
+- 3 1kΩ resistors
+- Micro SD card module
+- DFPlayer
+- 2 microSD
+- 3W Speaker
+- LCD Screen
+- Potentiometer 
+- Wires & Jumpers
+
+[Demo Link](https://youtu.be/O_sArSq9wAU)
+
+\* Final Prototype code is available on the [Github Repo](https://github.com/shgabr/Beat-Punch) inside the "finalPrototype" folder
 
 # Limitations
-**In Progress**
+- LCD communication can be unreliable
 
 # References
 
